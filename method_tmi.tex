@@ -1,0 +1,132 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Clinical Motivation and Task Definition}
+In medical image restoration, low-quality acquisitions (e.g., low-dose CT, accelerated MRI, or degraded ultrasound) often exhibit mixed degradations including noise amplification, texture attenuation, and structure-dependent artifacts. These degradations are particularly harmful for subtle lesions and fine anatomical boundaries, which are critical for quantitative diagnosis and treatment planning. We therefore formulate restoration as learning a continuous transport process from a degraded observation $x_T$ to its clean counterpart $x_0$.
+
+Given paired training data $\mathcal{D}=\{(x_T^{(i)},x_0^{(i)})\}_{i=1}^{N}$, we define a linear interpolation path
+\begin{equation}
+ x_t=(1-t)x_0+tx_T,\quad t\in(0,1),
+ \label{eq:path}
+\end{equation}
+with a time-invariant ground-truth velocity field
+\begin{equation}
+ v^{\star}=\frac{\mathrm{d}x_t}{\mathrm{d}t}=x_T-x_0.
+ \label{eq:gt_velocity}
+\end{equation}
+A parametric network $f_{\theta}$ predicts $\hat v=f_{\theta}(x_t,t,\cdot)$, and restoration is obtained by numerically integrating the learned velocity from $t=1$ to $t=0$.
+
+\subsection{Endpoint-Consistent Two-Stage Velocity Learning}
+\label{subsec:two_stage}
+Our training strategy contains two progressively coupled stages to improve both global transport accuracy and endpoint faithfulness.
+
+\paragraph{Stage I: Base velocity estimation.}
+For sampled $t$, the network predicts
+\begin{equation}
+ (\hat v_1,s_1)=f_{\theta}(x_t,t,\varnothing),
+\end{equation}
+where $s_1$ denotes optional log-variance for heteroscedastic regression. The velocity loss is
+\begin{equation}
+ \mathcal{L}_{v1}=\begin{cases}
+ \left[\frac{1}{2}e^{-s_1}\lVert\hat v_1-v^{\star}\rVert_2^2+\frac{1}{2}s_1\right]_{\text{mean}}, & \text{with uncertainty},\\
+ \lVert\hat v_1-v^{\star}\rVert_2^2, & \text{otherwise}.
+ \end{cases}
+ \label{eq:lv1}
+\end{equation}
+Given Eq.~\eqref{eq:path}, Stage-I endpoint prediction is analytically recovered as
+\begin{equation}
+ \hat x_0^{(1)}=\Phi(x_t,\hat v_1,t),
+\end{equation}
+where $\Phi(\cdot)$ denotes the induced inverse mapping from velocity to endpoint.
+
+\paragraph{Stage II: Endpoint-aware refinement (EMM).}
+Stage II reuses $\hat x_0^{(1)}$ as a cleaner intermediate estimate and constructs a refined state
+\begin{equation}
+ t_2=\max(\rho t,0.005),\qquad x_{t_2}=(1-t_2)\hat x_0^{(1)}+t_2x_T.
+\end{equation}
+The network then predicts
+\begin{equation}
+ (\hat v_2,s_2)=f_{\theta}(x_{t_2},t_2,(\hat x_0^{(1)},x_T)),
+\end{equation}
+with a symmetric velocity loss $\mathcal{L}_{v2}$ and endpoint estimate $\hat x_0^{(2)}=\Phi(x_{t_2},\hat v_2,t_2)$. This stage explicitly exploits endpoint cues to improve fine-structure correction near the clean manifold.
+
+\subsection{Dual Endpoint Supervision and Perceptual Constraint}
+\label{subsec:dual_supervision}
+To stabilize inverse mapping and preserve diagnostically relevant details, we apply dual endpoint supervision:
+\begin{equation}
+ \mathcal{L}_{x0}^{(1)}=\lVert\hat x_0^{(1)}-x_0\rVert_2^2,\qquad
+ \mathcal{L}_{x0}^{(2)}=\lVert\hat x_0^{(2)}-x_0\rVert_2^2.
+\end{equation}
+
+To recover high-frequency textures and small structures, we further introduce a perceptual loss on Stage-I endpoint output using VGG16 feature maps (relu1\_2, relu2\_2, relu3\_3):
+\begin{equation}
+ \mathcal{L}_{\mathrm{perc}}=\sum_{\ell}\lVert\phi_{\ell}(\hat x_0^{(1)})-\phi_{\ell}(x_0)\rVert_2^2.
+\end{equation}
+Although defined in image-feature space, this term empirically improves edge continuity and texture realism in medical regions with low contrast.
+
+\subsection{Endpoint Consistency Across Time}
+\label{subsec:consistency}
+A key objective of flow-based restoration is temporal coherence: querying different time points along the same transport path should imply a consistent clean endpoint. We therefore enforce endpoint consistency by sampling a second time point $t_b$ and computing
+\begin{equation}
+ \hat x_0^{(b)}=\Phi(x_{t_b},\hat v_b,t_b),\qquad \hat v_b=f_{\theta}(x_{t_b},t_b,\varnothing).
+\end{equation}
+The consistency loss is
+\begin{equation}
+ \mathcal{L}_{\mathrm{cons}}=\lVert\hat x_0^{(a)}-\hat x_0^{(b)}\rVert_2^2,
+\end{equation}
+where one branch is detached to prevent trivial co-adaptation. Specifically, we anchor the target using the prediction from the smaller time value (closer to the clean endpoint), which is typically more reliable. This design enforces a globally coherent velocity field and reduces time-dependent endpoint drift.
+
+\subsection{Biased Time Sampling and Stage-II Warmup}
+\label{subsec:sampling}
+Uniform time sampling under-emphasizes near-endpoint refinement. To focus training on clinically important detail recovery, we use a logit-normal sampler:
+\begin{equation}
+ z\sim\mathcal{N}(\mu,\sigma^2),\quad t=\mathrm{sigmoid}(z),\quad t\leftarrow 0.01+0.98t.
+\end{equation}
+Choosing $\mu<0$ biases samples toward small $t$, i.e., the clean endpoint regime where subtle structures are reconstructed.
+
+To avoid unstable early optimization, Stage-II contribution is linearly warmed up:
+\begin{equation}
+ \lambda_{s2}(k)=\begin{cases}
+ \lambda_{s2}\,k/K_w, & k<K_w,\\
+ \lambda_{s2}, & k\ge K_w,
+ \end{cases}
+\end{equation}
+where $k$ is iteration index and $K_w$ is warmup length.
+
+\subsection{Overall Objective and Optimization}
+\label{subsec:objective}
+The total training objective is
+\begin{equation}
+ \mathcal{L}=\mathcal{L}_{s1}+\lambda_{s2}(k)\mathcal{L}_{s2}+\lambda_{\mathrm{cons}}\mathcal{L}_{\mathrm{cons}},
+ \label{eq:total}
+\end{equation}
+with
+\begin{align}
+ \mathcal{L}_{s1}&=\mathcal{L}_{v1}+\lambda_{x0}\mathcal{L}_{x0}^{(1)}+\lambda_{\mathrm{perc}}\mathcal{L}_{\mathrm{perc}},\\
+ \mathcal{L}_{s2}&=\mathcal{L}_{v2}+\lambda_{x0}\mathcal{L}_{x0}^{(2)}.
+\end{align}
+We optimize $\theta$ using AdamW with cosine annealing and gradient clipping. During inference, we integrate the learned velocity field using an Euler solver to obtain $\hat x_0$ from $x_T$. When uncertainty heads are enabled, we additionally produce pixel/voxel-wise uncertainty maps to support reliability-aware clinical interpretation.
+
+\subsection{Algorithmic Summary}
+\label{subsec:algorithm}
+\begin{algorithm}[t]
+\caption{Endpoint-Consistent EMM-RF Training}
+\label{alg:emm_rf}
+\begin{algorithmic}[1]
+\REQUIRE Paired data $(x_T,x_0)$, network $f_{\theta}$, warm-path operator, weights $\lambda_{x0},\lambda_{\mathrm{perc}},\lambda_{\mathrm{cons}},\lambda_{s2}$
+\FOR{iteration $k=1,\dots,K$}
+  \STATE Sample batch $(x_T,x_0)$ and time $t$ (uniform or logit-normal)
+  \STATE Construct $x_t=(1-t)x_0+tx_T$, compute $v^{\star}=x_T-x_0$
+  \STATE \textbf{Stage I:} $(\hat v_1,s_1)=f_{\theta}(x_t,t,\varnothing)$
+  \STATE Compute $\mathcal{L}_{v1}$ and $\hat x_0^{(1)}=\Phi(x_t,\hat v_1,t)$
+  \STATE Compute $\mathcal{L}_{x0}^{(1)}$ and $\mathcal{L}_{\mathrm{perc}}$
+  \STATE \textbf{Stage II prep:} $t_2\leftarrow\max(\rho t,0.005)$, $x_{t_2}\leftarrow(1-t_2)\,\mathrm{stopgrad}(\hat x_0^{(1)})+t_2x_T$
+  \STATE \textbf{Stage II:} $(\hat v_2,s_2)=f_{\theta}(x_{t_2},t_2,(\hat x_0^{(1)},x_T))$
+  \STATE Compute $\mathcal{L}_{v2}$, $\hat x_0^{(2)}$, and $\mathcal{L}_{x0}^{(2)}$
+  \STATE Sample $t_b$, compute $\hat x_0^{(b)}$, enforce $\mathcal{L}_{\mathrm{cons}}$ with one-side stop-gradient anchor
+  \STATE Warm up $\lambda_{s2}(k)$ and form total loss via Eq.~\eqref{eq:total}
+  \STATE Update $\theta$ by backpropagation
+\ENDFOR
+\RETURN Trained model parameters $\theta$
+\end{algorithmic}
+\end{algorithm}
